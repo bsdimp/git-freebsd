@@ -1,0 +1,332 @@
+#!/usr/bin/env python3
+#
+# git-mfc - Merge commits from main to a stable/XX branch
+#
+# Copyright (c) 2023 M. Warner Losh <imp@FreeBSD.org>
+#
+# SPX-License-Identifier: MIT
+#
+# Some code taken verbatim (or lightly tweaked) from git-publish by
+# Stefan Hajnoczi <stefanha@gmail.com> licensed under MIT.
+# I've tried to mark it with #git-publish+ ... #git-publish-
+#
+
+#
+# Theory of operation:
+#
+# You run this in a directory with stable/XX checked out. You can update to the
+# latest with --update. Your MFCs will go into a branch called, by default
+# stable/mfcXX, that you can then push upstream. The default upstream remote is
+# 'freebsd' but that can be changed. MFCs, per project policy, are done simply with
+# 'git cherry-pick -x'. --rebase will automatically rebase any stable/mfcXX branch
+# to the top of stable/XX.
+#
+# so base='stable/XX'
+# and mfc='stable/mfcXX'
+# These names are currently baked into the script. Sorry.
+#
+# --setup will add alias to .gitconfig for git-mfc.
+#
+# --update
+
+import glob
+import datetime
+import locale
+import optparse
+import os
+import re
+import subprocess
+import sys
+
+VERSION = '0.0.1'
+
+stable_branch_re = re.compile(r'^stable/(\d+)$')
+mfc_branch_re = re.compile(r'^stable/mfc(\d+)$')
+
+#git-publish+
+
+# Encoding for command-line arguments
+CMDLINE_ENCODING = locale.getpreferredencoding()
+
+# Encoding for communicating with the Git executable
+GIT_ENCODING = 'utf-8'
+
+# Encoding for files that GIT_EDITOR can edit
+TEXTFILE_ENCODING = CMDLINE_ENCODING
+
+# As a git alias it is helpful to be a single file script with no external
+# dependencies, so these git command-line wrappers are used instead of
+# python-git.
+
+class GitError(Exception):
+    pass
+
+class GitHookError(Exception):
+    pass
+
+def to_text(data):
+    if isinstance(data, bytes):
+        return data.decode(CMDLINE_ENCODING)
+    return data
+
+def popen_lines(cmd, **kwargs):
+    '''Communicate with a Popen object and return a list of lines for stdout and stderr'''
+    stdout, stderr = cmd.communicate(**kwargs)
+    stdout = re.split('\r\n|\n',stdout.decode(GIT_ENCODING))[:-1]
+    stderr = re.split('\r\n|\n',stderr.decode(GIT_ENCODING))[:-1]
+    return stdout, stderr
+
+def _git_check(*args):
+    '''Run a git command and return a list of lines, may raise GitError'''
+    cmdstr = 'git ' + ' '.join(('"%s"' % arg if ' ' in arg else arg) for arg in args)
+    if VERBOSE:
+        print(cmdstr)
+    cmd = subprocess.Popen(['git'] + list(args),
+                           stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE)
+    stdout, stderr = popen_lines(cmd)
+    if cmd.returncode != 0:
+        raise GitError('ERROR: %s\n%s' % (cmdstr, '\n'.join(stderr)))
+    return stdout
+
+def _git(*args):
+    '''Run a git command and return a list of lines, ignore errors'''
+    try:
+        return _git_check(*args)
+    except GitError:
+        # ignore git command errors
+        return []
+
+def _git_with_stderr(*args):
+    '''Run a git command and return a list of lines for stdout and stderr'''
+    if VERBOSE:
+        print('git ' + ' '.join(args))
+    cmd = subprocess.Popen(['git'] + list(args),
+                           stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE)
+    stdout, stderr = popen_lines(cmd)
+    return stdout, stderr, cmd.returncode
+
+def git_get_current_branch():
+    git_dir = git_get_git_dir()
+    rebase_dir = os.path.join(git_dir, 'rebase-merge')
+    if os.path.exists(rebase_dir):
+        branch_path = os.path.join(rebase_dir, 'head-name')
+        prefix = 'refs/heads/'
+        # Path names are encoded in UTF-8 normalization form C.
+        with open(branch_path, encoding=GIT_ENCODING) as f:
+            branch = f.read().strip()
+        if branch.startswith(prefix):
+            return branch[len(prefix):]
+        return branch
+    else:
+        return _git_check('symbolic-ref', '--short', 'HEAD')[0]
+
+GIT_TOPLEVEL = None
+def git_get_toplevel_dir():
+    global GIT_TOPLEVEL
+    if GIT_TOPLEVEL is None:
+        GIT_TOPLEVEL = _git_check('rev-parse', '--show-toplevel')[0]
+    return GIT_TOPLEVEL
+
+GIT_DIR = None
+def git_get_git_dir():
+    global GIT_DIR
+    if GIT_DIR is None:
+        GIT_DIR = _git('rev-parse', '--git-dir')[0]
+    return GIT_DIR
+
+def git_branch_exists(branch):
+    '''Check if the given branch exists'''
+    try:
+        _git_check('rev-parse', '-q', '--verify', branch)
+        return True
+    except GitError:
+        return False
+
+def setup():
+    '''Add git alias in ~/.gitconfig'''
+    path = os.path.abspath(sys.argv[0])
+    ret = subprocess.call(['git', 'config', '--global',
+                           'alias.mfc', '!' + path])
+    if ret == 0:
+        print('You can now use \'git mfc\' like a built-in git command.')
+
+#git-publish-
+
+def git_fetch(remote):
+    '''Try to fetch updates from remote'''
+    return _git_check('fetch', remote)
+
+def git_status():
+    '''Return status of the tree'''
+    return _git_check('status', '--short')
+
+def git_checkout(*args):
+    '''Return status of the tree'''
+    return _git_check('checkout', *args)
+
+def git_rev_list(*args):
+    '''Expand 'arg' to the hashes it refers to'''
+    return _git_check('rev-list', *args)
+
+# This likely can be more elegant and general...
+def get_branches(current):
+    m = mfc_branch_re.match(current)
+    s = stable_branch_re.match(current)
+    if m:
+        mfc = current
+        major = int(m.group(1))
+        stable = 'stable/%d' % major
+    elif s:
+        stable = current
+        major = int(s.group(1))
+        mfc = 'stable/mfc%d' % major
+    else:
+        raise GitError('Cannot determine stable / mfc branches from %s' % current)
+    return (stable, mfc)
+
+def freebsd_mfc(hash):
+    print('Trying to MFC %s' % hash)
+    # This likely could be done more eassily...
+    _git_check('cherry-pick', '-x', hash)
+    # Reset the committer date to be now
+    _git_check('commit', '--amend', '--no-edit', '--date', str(datetime.datetime.now()))
+
+def must_be_clean():
+    status = git_status()
+    if len(status):
+        print('Working tree not clean')
+        print(status)
+#        sys.exit(1)
+
+def find_candidates(stable, mfc, *paths):
+    final = []
+    revs = git_rev_list('--cherry-pick', '--right-only', '%s..main' % stable, *paths)
+    print('Found %d possible revs to merge' % len(revs))
+    # Now look if we have an exclusion list
+    for p in paths:
+        git_dir = git_get_toplevel_dir()
+        dir = os.path.join(git_dir, p)
+        if os.path.exists(dir):
+            x = os.path.join(dir, 'mfc.exclude')
+            with open(x, 'r') as f:
+                xlist = f.read().split()
+            for xx in xlist:
+                for r in revs:
+                    if r.startswith(xx):
+                        revs.remove(r)
+                        break
+        
+    for r in revs:
+        l=_git_check('log', '--grep', r, 'main..%s' % stable)
+        if len(l) < 1:
+            final.append(r)
+            print(r)
+    # At this point we should allow an 'exclude' file since there's always
+    # something that goes wrong.
+    print('Narrowed to %d possible revs to merge after grepping' % len(final))
+    
+    return 0
+
+def parse_args():
+
+    parser = optparse.OptionParser(version='%%prog %s' % VERSION,
+            usage='%prog [options] -- [common format-patch options]',
+            description='Do all the MFC tweaks needed when merging from main to stable/XX.',
+            epilog='Please report bugs to Warner Losh <imp@freebsd.org>.')
+    parser.add_option('-b', '--base', dest='base', default=None,
+                      help='branch which this is based off [defaults to stable/XX]')
+    parser.add_option('--candidates', dest='candidates', action='store_true', default=False,
+                      help='list possible versions to merge from main')
+    parser.add_option('--setup', dest='setup', action='store_true', default=False,
+                      help='add git alias in ~/.gitconfig')
+    parser.add_option('--update', dest='update', action='store_true', default=False,
+                      help='Update your stable/XX branch to upstream')
+    parser.add_option('--upstream', dest='upstream', default='freebsd',
+                      help='Upstream remote name, defaults to freebsd')
+    parser.add_option('-v', '--verbose', dest='verbose',
+                      action='store_true', default=False,
+                      help='show executed git commands (useful for troubleshooting)')
+
+    return parser.parse_args()
+
+def main():
+    global VERBOSE
+
+    options, args = parse_args()
+    VERBOSE = options.verbose
+    
+
+    # Keep this before any operations that call out to git(1) so that setup
+    # works when the current working directory is outside a git repo.
+    if options.setup:
+        setup()
+        return 0
+
+    try:
+        git_get_toplevel_dir()
+    except GitError:
+        print('Unable to find git directory, are you sure you are in a git repo?')
+        return 1
+
+    current_branch = git_get_current_branch()
+
+    print('Current branch %s\n' % current_branch)
+
+    (stable, mfc) = get_branches(current_branch)
+
+    print('Stable: %s\nMFC: %s' % (stable, mfc))
+
+    if not git_branch_exists(stable):
+        print('Branch "%s" does not exist, but %s is checked out', stable, current_branch)
+        return 1
+
+    # Get a list of candidates
+    if options.candidates:
+        find_candidates(stable, mfc, *args)
+        return 0
+
+    # Do we want to update?
+    if options.update:
+        # Check to see if we're on the MFC branch
+        if current_branch == mfc:
+            must_be_clean()
+            print('Fetching remote %s' % options.upstream)
+            git_fetch(options.upstream)
+            print('Checking out branch %s' % stable)
+            git_checkout(stable)
+        else:
+            if not git_branch_exists(mfc):
+                print('MFC branch %s does not exist' % mfc)
+            print('Fetching remote %s' % options.upstream)
+            git_fetch(options.upstream)
+        # stable branch is checked out, do the merge
+        print('Updating %s branch' % stable)
+        _git_check('merge', '--ff-only', '%s/%s' % (options.upstream, stable))
+        if git_get_current_branch() != mfc:
+            if git_branch_exists(mfc):
+                print('Rebasing %s' % mfc)
+                _git_check('rebase', stable, mfc)
+        print('update complete on %s' % stable)
+
+    # switch branches
+    must_be_clean()
+    if git_get_current_branch() != mfc:
+        if git_branch_exists(mfc):
+            print('Checking out %s' % mfc)
+            _git_check('checkout', mfc)
+        else:
+            print('Creating new %s brnach' % mfc)
+            _git_check('checkout', '-b', mfc)
+
+    # Now iterate through revisions to merge
+    for a in args:
+#        for r in git_rev_list(a):
+# need to understand why the above is bogus
+            freebsd_mfc(a)
+
+    return 0
+
+if __name__ == '__main__':
+    sys.exit(main())
