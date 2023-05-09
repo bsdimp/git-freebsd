@@ -28,6 +28,17 @@
 # --setup will add alias to .gitconfig for git-mfc.
 #
 # --update
+#
+# --skip <hashes> skip these hashes
+#
+# Stores files .git/freebsd/mfc-*
+#	-skipped	hashes added to the skip list
+#	-merged		cache of hashes that show up as merged, but we found in
+#			log entry with --grep
+#
+# Plan to add --mfc-after to flag you want the subset of hashes that have a MFC After:
+# line indicating that it's time to merge.
+#
 
 import glob
 import datetime
