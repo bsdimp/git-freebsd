@@ -152,6 +152,24 @@ def parse_args():
     parser.add_option('-f', '--force', dest='force',
                       action='store_true', default=False,
                       help='Force: abandon old work, if any')
+    parser.add_option('--delete', dest='delete',
+                      action='store_true', default=False,
+                      help='Delete any branches that refernce this PR')
+    parser.add_option('--push', dest='push',
+                      action='store_true', default=False,
+                      help='Push this branch to the remote')
+    parser.add_option('--update', dest='update',
+                      action='store_true', default=False,
+                      help='Update the tree to main after pushing')
+    parser.add_option('--rebase', dest='rebase',
+                      action='store_true', default=False,
+                      help='Fetch latest freebsd/main, ff-merge it to main, then rebase the PR to that')
+    parser.add_option('--stage', dest='stage',
+                      action='store_true', default=False,
+                      help='Cherrypick the PR-xxx branch into main')
+    parser.add_option('--mark', dest='mark',
+                      action='store_true', default=False,
+                      help='Do the editing / marking on the PR branch')
 
     return parser.parse_args()
 
@@ -171,6 +189,13 @@ def fetch(url, dst):
         raise FetchError('ERROR: %s\n%s' % (cmdstr, '\n'.join(stderr)))
     return stdout
     
+def ghpr_rebase(upstream, branch):
+    _git_check('fetch', upstream)
+    _git_check('rebase', '-i', f"{upstream}/main", branch)
+
+def ghpr_stage(branch):
+    _git_check('cherry-pick', '--ff', f"main..{branch}")
+
 def main():
     global VERBOSE, FORCE
 
@@ -196,12 +221,23 @@ def main():
 
     git_checkout('main')
 
-    branch = 'PR-%s' % options.pr
+    branch = f'{options.branch}-{options.pr}'
+
+    if options.stage:
+        if not git_branch_exists(branch):
+            print(f'The {branch} branch for the PR does not exist to rebase')
+        ghpr_stage(branch)
+        return 0
+    if options.rebase:
+        if not git_branch_exists(branch):
+            print(f'The {branch} branch for the PR does not exist to rebase')
+        ghpr_rebase(options.upstream, branch)
+        return 0
     if git_branch_exists(branch):
         if FORCE:
             git_branch_delete(branch)
         else:
-            print('Still lamely requires a unique branch, and %s exists' % options.branch)
+            print('Still lamely requires a unique branch, and %s exists' % branch)
             return 1
 
     git_checkout('-b', branch, 'main')
@@ -209,7 +245,7 @@ def main():
     tmp = '/tmp/%s.patch' % options.pr
     fetch('https://patch-diff.githubusercontent.com/raw/freebsd/freebsd-src/pull/%s.patch' % options.pr,
           tmp)
-    _git_check('am', '--3way', '--ignore-date', tmp)
+    _git_check('am', '--3way', tmp)
 
     # Now, rebase this to main to add the trailers we need, but with an editor
     # that s/-/ / in those trailers because git doesn't like trailers with
@@ -218,6 +254,8 @@ def main():
                '--exec',
                'env EDITOR=$HOME/bin/git-fixup-editor git commit --amend --trailer "Reviewed-by: imp" --trailer "Pull-Request: https://github.com/freebsd/freebsd-src/pull/%s"' % options.pr,
                )
+    os.chdir(GIT_TOPLEVEL)
+    subprocess.call(['tools/build/checkstyle9.pl','main..'])
     print('I claim PR %s is now a series of commits ready for closer review' % options.pr)
 
 if __name__ == '__main__':
